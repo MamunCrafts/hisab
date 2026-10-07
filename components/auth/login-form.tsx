@@ -41,8 +41,10 @@ export function LoginForm() {
       setFormError(authErrorKey(error));
       return;
     }
-    const synced = await syncPreferencesAction();
-    if (synced.ok && synced.theme) setTheme(synced.theme);
+    // Best-effort: a stale client after a redeploy can't reach this action (409),
+    // and that must not block an already-successful sign-in.
+    const synced = await syncPreferencesAction().catch(() => null);
+    if (synced?.ok && synced.theme) setTheme(synced.theme);
     router.replace(safeNextPath(searchParams.get("next")));
     router.refresh();
   }

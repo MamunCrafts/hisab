@@ -1,23 +1,56 @@
 import "server-only";
 import { del, get, list, put } from "@vercel/blob";
+import { AwsClient } from "aws4fetch";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ATTACHMENT_MAX_BYTES, ATTACHMENT_TYPES, type AttachmentType } from "@/lib/constants";
 
 /**
- * Private file storage for receipts. Uses Vercel Private Blob when configured;
- * falls back to the local filesystem in development. Files are only ever
- * served through the authenticated /api/attachments/[id] route.
+ * Private file storage for receipts and avatars. Uses Cloudflare R2 when
+ * configured, then Vercel Private Blob; falls back to the local filesystem in
+ * development. Files are only ever served through authenticated routes
+ * (/api/attachments/[id], /api/avatar).
  */
 
 const LOCAL_ROOT = path.join(process.cwd(), ".data", "uploads");
+
+type R2Config = { client: AwsClient; baseUrl: string };
+let r2Cache: R2Config | null | undefined;
+
+function r2(): R2Config | null {
+  if (r2Cache !== undefined) return r2Cache;
+  const { R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_ENDPOINT } = process.env;
+  if (!R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET || (!R2_ACCOUNT_ID && !R2_ENDPOINT)) {
+    r2Cache = null;
+    return null;
+  }
+  const endpoint = (R2_ENDPOINT || `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`).replace(/\/+$/, "");
+  r2Cache = {
+    client: new AwsClient({
+      accessKeyId: R2_ACCESS_KEY_ID,
+      secretAccessKey: R2_SECRET_ACCESS_KEY,
+      service: "s3",
+      region: "auto",
+    }),
+    baseUrl: `${endpoint}/${encodeURIComponent(R2_BUCKET)}`,
+  };
+  return r2Cache;
+}
+
+function r2ObjectUrl(config: R2Config, key: string) {
+  return `${config.baseUrl}/${key.split("/").map(encodeURIComponent).join("/")}`;
+}
+
+async function r2Fetch(config: R2Config, url: string, init?: RequestInit): Promise<Response> {
+  return config.client.fetch(url, { ...init, signal: AbortSignal.timeout(15_000) });
+}
 
 function blobEnabled(): boolean {
   return Boolean(process.env.BLOB_READ_WRITE_TOKEN || process.env.BLOB_STORE_ID);
 }
 
 export function isStorageConfigured(): boolean {
-  return blobEnabled() || process.env.NODE_ENV !== "production";
+  return Boolean(r2()) || blobEnabled() || process.env.NODE_ENV !== "production";
 }
 
 const EXTENSIONS: Record<AttachmentType, string> = {
@@ -57,8 +90,22 @@ function userPrefix(userId: string) {
   return `users/${userId}/`;
 }
 
-export async function storeAttachment(userId: string, file: ValidatedFile): Promise<string> {
-  const key = `${userPrefix(userId)}receipts/${crypto.randomUUID()}.${EXTENSIONS[file.contentType]}`;
+export async function storeAttachment(
+  userId: string,
+  file: ValidatedFile,
+  folder: "receipts" | "avatars" = "receipts",
+): Promise<string> {
+  const key = `${userPrefix(userId)}${folder}/${crypto.randomUUID()}.${EXTENSIONS[file.contentType]}`;
+  const r2Config = r2();
+  if (r2Config) {
+    const res = await r2Fetch(r2Config, r2ObjectUrl(r2Config, key), {
+      method: "PUT",
+      body: Buffer.from(file.bytes),
+      headers: { "Content-Type": file.contentType, "Content-Length": String(file.size) },
+    });
+    if (!res.ok) throw new Error(`R2 upload failed with status ${res.status}`);
+    return key;
+  }
   if (blobEnabled()) {
     const result = await put(key, Buffer.from(file.bytes), {
       access: "private",
@@ -79,6 +126,13 @@ export async function storeAttachment(userId: string, file: ValidatedFile): Prom
 export async function readAttachment(
   storageKey: string,
 ): Promise<{ body: ReadableStream<Uint8Array> | Uint8Array; contentType?: string } | null> {
+  const r2Config = r2();
+  if (r2Config) {
+    const res = await r2Fetch(r2Config, r2ObjectUrl(r2Config, storageKey));
+    if (res.status === 404) return null;
+    if (!res.ok || !res.body) throw new Error(`R2 read failed with status ${res.status}`);
+    return { body: res.body, contentType: res.headers.get("content-type") ?? undefined };
+  }
   if (blobEnabled()) {
     const result = await get(storageKey, { access: "private" });
     if (!result || result.statusCode !== 200) return null;
@@ -95,6 +149,12 @@ export async function readAttachment(
 
 export async function deleteAttachmentFile(storageKey: string): Promise<void> {
   try {
+    const r2Config = r2();
+    if (r2Config) {
+      const res = await r2Fetch(r2Config, r2ObjectUrl(r2Config, storageKey), { method: "DELETE" });
+      if (!res.ok && res.status !== 404) throw new Error(`R2 delete failed with status ${res.status}`);
+      return;
+    }
     if (blobEnabled()) {
       await del(storageKey);
       return;
@@ -110,6 +170,25 @@ export async function deleteAttachmentFile(storageKey: string): Promise<void> {
 /** Removes every stored file for a user (account deletion). */
 export async function deleteAllUserAttachments(userId: string): Promise<void> {
   const prefix = userPrefix(userId);
+  const r2Config = r2();
+  if (r2Config) {
+    let token: string | undefined;
+    do {
+      const params = new URLSearchParams({ "list-type": "2", prefix, "max-keys": "1000" });
+      if (token) params.set("continuation-token", token);
+      const res = await r2Fetch(r2Config, `${r2Config.baseUrl}?${params}`);
+      if (!res.ok) throw new Error(`R2 list failed with status ${res.status}`);
+      const xml = await res.text();
+      const keys = [...xml.matchAll(/<Key>([^<]+)<\/Key>/g)].map((m) => decodeXml(m[1]));
+      for (let i = 0; i < keys.length; i += 10) {
+        await Promise.all(keys.slice(i, i + 10).map(deleteAttachmentFile));
+      }
+      const truncated = /<IsTruncated>true<\/IsTruncated>/.test(xml);
+      const next = xml.match(/<NextContinuationToken>([^<]+)<\/NextContinuationToken>/)?.[1];
+      token = truncated && next ? decodeXml(next) : undefined;
+    } while (token);
+    return;
+  }
   if (blobEnabled()) {
     let cursor: string | undefined;
     do {
@@ -120,4 +199,13 @@ export async function deleteAllUserAttachments(userId: string): Promise<void> {
     return;
   }
   await rm(path.join(LOCAL_ROOT, prefix), { recursive: true, force: true });
+}
+
+function decodeXml(value: string): string {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
 }

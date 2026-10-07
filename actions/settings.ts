@@ -42,7 +42,7 @@ export async function updateAvatarAction(formData: FormData) {
       if (file.size > AVATAR_MAX) throw new UserFacingError("validation.fileSize", "avatar");
       const checked = await validateAttachment(file);
       if (!checked.ok || checked.file.contentType === "application/pdf") throw new UserFacingError("validation.fileType", "avatar");
-      const key = await storeAttachment(userId, checked.file);
+      const key = await storeAttachment(userId, checked.file, "avatars");
       await db.update(profiles).set({ avatarUrl: `key:${key}` }).where(eq(profiles.userId, userId));
     }
     if (previousKey) await deleteAttachmentFile(previousKey);
